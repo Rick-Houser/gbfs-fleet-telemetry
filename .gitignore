@@ -1,0 +1,23 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Local configuration & secrets
+.env
+*.log
+
+# Docker volume data / local datastores
+.postgres_data/
+.redis_data/
+.grafana_data/
+
+# IDE / OS metadata
+.DS_Store
+.vscode/
+.idea/
