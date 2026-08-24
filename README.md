@@ -28,7 +28,7 @@ flowchart TD
 ```
 
 ## Documentation
-* 🛠️ [Implementation Roadmap](./docs/WALKTHROUGH.md)
+* 🛠️ [Implementation Roadmap(coming soon)](./)
 
 ## Quickstart
 *(Deployment commands coming soon)*
