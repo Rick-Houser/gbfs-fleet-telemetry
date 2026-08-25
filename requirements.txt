@@ -1,0 +1,4 @@
+requests==2.31.0
+redis==5.0.1
+psycopg2-binary==2.9.12
+pandas==2.2.1
