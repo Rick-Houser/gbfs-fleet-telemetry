@@ -53,8 +53,9 @@ POSTGRES_DSN = (
 def fetch_fleet_status() -> dict[str, Any]:
     """Fetch the current GBFS free_bike_status payload.
 
-    Exits on failure rather than retrying internally — this cycle is
-    invoked by an external scheduler, which owns retry/backoff policy.
+    Exits with a nonzero code on failure — this runs as a cron job,
+    so cron (and any log/exit-code monitoring around it) owns retry
+    cadence, not the script itself.
     """
     headers = {
         "User-Agent": (
