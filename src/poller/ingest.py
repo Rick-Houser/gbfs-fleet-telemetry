@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -53,9 +54,9 @@ POSTGRES_DSN = (
 def fetch_fleet_status() -> dict[str, Any]:
     """Fetch the current GBFS free_bike_status payload.
 
-    Exits with a nonzero code on failure — this runs as a cron job,
-    so cron (and any log/exit-code monitoring around it) owns retry
-    cadence, not the script itself.
+    Raises requests.exceptions.RequestException on failure — the caller
+    logs the run outcome before deciding how to exit, so this no longer
+    exits the process directly.
     """
     headers = {
         "User-Agent": (
@@ -63,13 +64,9 @@ def fetch_fleet_status() -> dict[str, Any]:
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
     }
-    try:
-        response = requests.get(GBFS_URL, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.RequestException:
-        logger.exception("Failed to fetch GBFS data")
-        sys.exit(1)
+    response = requests.get(GBFS_URL, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+    response.raise_for_status()
+    return response.json()
 
 
 def normalize_bike(bike: dict[str, Any], reported_at: datetime) -> dict[str, Any]:
@@ -88,9 +85,12 @@ def normalize_bike(bike: dict[str, Any], reported_at: datetime) -> dict[str, Any
     }
 
 
-def write_to_redis(client: redis.Redis, records: list[dict[str, Any]]) -> None:
+def write_to_redis(client: redis.Redis, records: list[dict[str, Any]]) -> bool:
     """Cache current vehicle state. Best-effort: Postgres is the system of record,
-    so a Redis outage should degrade read latency, not halt ingestion."""
+    so a Redis outage should degrade read latency, not halt ingestion.
+
+    Returns whether the write succeeded, for the run-summary log.
+    """
     try:
         pipeline = client.pipeline()
         for record in records:
@@ -99,13 +99,18 @@ def write_to_redis(client: redis.Redis, records: list[dict[str, Any]]) -> None:
             pipeline.expire(key, REDIS_CACHE_TTL_SECONDS)
         pipeline.execute()
         logger.info("Cached %d vehicle records to Redis", len(records))
+        return True
     except redis.RedisError:
         logger.exception("Redis write failed; continuing to Postgres")
+        return False
 
 
-def write_to_postgres(conn: psycopg2.extensions.connection, records: list[dict[str, Any]]) -> None:
+def write_to_postgres(conn: psycopg2.extensions.connection, records: list[dict[str, Any]]) -> bool:
     """Upsert dim_vehicle and append fact_vehicle_status in one transaction,
-    so a partial-fleet failure can't corrupt the history table."""
+    so a partial-fleet failure can't corrupt the history table.
+
+    Returns whether the write succeeded, for the run-summary log.
+    """
     try:
         with conn.cursor() as cursor:
             psycopg2.extras.execute_values(
@@ -137,34 +142,93 @@ def write_to_postgres(conn: psycopg2.extensions.connection, records: list[dict[s
             )
         conn.commit()
         logger.info("Persisted %d vehicle status events to Postgres", len(records))
+        return True
     except psycopg2.Error:
         conn.rollback()
         logger.exception("Postgres write failed; transaction rolled back")
+        return False
+
+
+def log_run_summary(
+    vehicles_fetched: int,
+    redis_success: bool,
+    postgres_success: bool,
+    duration_ms: int,
+    error_message: str | None = None,
+) -> None:
+    """Record one row summarizing this cycle's outcome.
+
+    Uses its own connection, separate from the main vehicle-data write,
+    so a problem with the fleet data transaction never prevents the
+    pipeline from reporting on itself. Best-effort: if even this fails,
+    log it and move on rather than raising out of a cycle that may have
+    otherwise succeeded.
+    """
+    try:
+        conn = psycopg2.connect(POSTGRES_DSN)
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO ingest_run_log
+                        (vehicles_fetched, redis_success, postgres_success, duration_ms, error_message)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (vehicles_fetched, redis_success, postgres_success, duration_ms, error_message),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except psycopg2.Error:
+        logger.exception("Failed to write run summary to ingest_run_log")
 
 
 def run_ingest_cycle() -> None:
-    """Fetch, normalize, and write one poll of the GBFS feed."""
-    payload = fetch_fleet_status()
-    bikes = payload.get("data", {}).get("bikes", [])
-    # GBFS reports last_updated as a Unix epoch int; the timestamptz
-    # column needs a real datetime, not the raw integer.
-    reported_at = datetime.fromtimestamp(payload["last_updated"], tz=timezone.utc)
+    """Fetch, normalize, and write one poll of the GBFS feed.
 
-    if not bikes:
-        logger.warning("GBFS feed returned zero vehicles; skipping writes this cycle")
-        return
+    Always records a summary row to ingest_run_log, success or failure,
+    then exits nonzero if the fetch itself failed — cron uses that
+    exit code, ingest_run_log carries the detail behind it.
+    """
+    start = time.monotonic()
+    vehicles_fetched = 0
+    redis_success = False
+    postgres_success = False
+    error_message: str | None = None
 
-    records = [normalize_bike(bike, reported_at) for bike in bikes]
-    logger.info("Fetched %d vehicles from Bay Wheels", len(records))
-
-    redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
-    write_to_redis(redis_client, records)
-
-    pg_conn = psycopg2.connect(POSTGRES_DSN)
     try:
-        write_to_postgres(pg_conn, records)
+        payload = fetch_fleet_status()
+        bikes = payload.get("data", {}).get("bikes", [])
+        # GBFS reports last_updated as a Unix epoch int; the timestamptz
+        # column needs a real datetime, not the raw integer.
+        reported_at = datetime.fromtimestamp(payload["last_updated"], tz=timezone.utc)
+
+        if not bikes:
+            logger.warning("GBFS feed returned zero vehicles; skipping writes this cycle")
+            error_message = "empty feed"
+            return
+
+        records = [normalize_bike(bike, reported_at) for bike in bikes]
+        vehicles_fetched = len(records)
+        logger.info("Fetched %d vehicles from Bay Wheels", vehicles_fetched)
+
+        redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+        redis_success = write_to_redis(redis_client, records)
+
+        pg_conn = psycopg2.connect(POSTGRES_DSN)
+        try:
+            postgres_success = write_to_postgres(pg_conn, records)
+        finally:
+            pg_conn.close()
+    except requests.exceptions.RequestException as e:
+        logger.exception("Failed to fetch GBFS data")
+        error_message = f"fetch failed: {e}"
     finally:
-        pg_conn.close()
+        duration_ms = int((time.monotonic() - start) * 1000)
+        log_run_summary(vehicles_fetched, redis_success, postgres_success, duration_ms, error_message)
+
+    if error_message is not None and error_message.startswith("fetch failed"):
+        sys.exit(1)
 
 
 if __name__ == "__main__":
