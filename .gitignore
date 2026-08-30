@@ -11,6 +11,7 @@ ENV/
 # Local configuration & secrets
 .env
 *.log
+logs/
 
 # Docker volume data / local datastores
 .postgres_data/
