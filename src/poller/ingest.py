@@ -1,6 +1,6 @@
-"""GBFS ingestion pipeline for Bay Wheels vehicle telemetry.
+"""GBFS ingestion pipeline for Lime vehicle telemetry (San Francisco).
 
-Polls the Lyft GBFS free_bike_status feed and writes each vehicle
+Polls Lime's GBFS free_bike_status feed and writes each vehicle
 record to two sinks with different guarantees: Redis (best-effort
 cache of current state) and Postgres (source of truth, append-only
 event history).
@@ -29,7 +29,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-GBFS_URL = "https://gbfs.lyft.com/gbfs/2.3/bay/en/free_bike_status.json"
+GBFS_URL = "https://data.lime.bike/api/partners/v2/gbfs/san_francisco/free_bike_status"
+# Slow-changing (ttl=86400 in Lime's feed): maps vehicle_type_id to
+# max_range_meters, needed to convert current_range_meters into a
+# battery percentage. Refetched every cycle for simplicity — it's a
+# small file, and there's no in-memory state across cron invocations
+# to cache it in anyway.
+VEHICLE_TYPES_URL = "https://data.lime.bike/api/partners/v2/gbfs/san_francisco/vehicle_types"
 REQUEST_TIMEOUT_SECONDS = 10
 
 REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
@@ -69,18 +75,61 @@ def fetch_fleet_status() -> dict[str, Any]:
     return response.json()
 
 
-def normalize_bike(bike: dict[str, Any], reported_at: datetime) -> dict[str, Any]:
-    """Map a raw GBFS bike record onto the dim_vehicle/fact_vehicle_status schema."""
-    fuel_fraction = bike.get("current_fuel_percent")
+def fetch_vehicle_type_ranges() -> dict[str, float]:
+    """Fetch vehicle_types.json and return {vehicle_type_id: max_range_meters}.
+
+    Only motorized types publish max_range_meters — human-powered
+    bikes are absent from the returned mapping, which is how
+    normalize_bike knows to report battery_level as None for them.
+    Raises requests.exceptions.RequestException on failure, same as
+    fetch_fleet_status — the caller decides how to handle it.
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+    }
+    response = requests.get(VEHICLE_TYPES_URL, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+    response.raise_for_status()
+    vehicle_types = response.json().get("data", {}).get("vehicle_types", [])
+    return {
+        vt["vehicle_type_id"]: vt["max_range_meters"]
+        for vt in vehicle_types
+        if "max_range_meters" in vt
+    }
+
+
+def normalize_bike(
+    bike: dict[str, Any], reported_at: datetime, type_ranges: dict[str, float]
+) -> dict[str, Any]:
+    """Map a raw GBFS bike record onto the dim_vehicle/fact_vehicle_status schema.
+
+    Lime doesn't publish a fuel-percent field directly — battery level
+    is derived from current_range_meters against that vehicle type's
+    max_range_meters (from vehicle_types.json). Human-powered bikes
+    have no entry in type_ranges, so battery_level is correctly None
+    for them rather than a fabricated 0.
+    """
+    current_range = bike.get("current_range_meters")
+    max_range = type_ranges.get(bike.get("vehicle_type_id"))
+    battery_level = None
+    if current_range is not None and max_range:
+        # min(100, ...) guards against sensor noise reporting slightly
+        # over max_range_meters.
+        battery_level = min(100, round(100 * current_range / max_range))
+
     return {
         "vehicle_id": bike["bike_id"],
-        "vehicle_type": bike.get("vehicle_type_id", "unknown"),
+        # Lime includes this human-readable form_factor as a
+        # convenience field beyond the GBFS spec; fall back to the
+        # numeric ID if it's ever absent.
+        "vehicle_type": bike.get("vehicle_type", bike.get("vehicle_type_id", "unknown")),
         "is_disabled": bool(bike.get("is_disabled", 0)),
         "is_reserved": bool(bike.get("is_reserved", 0)),
-        # GBFS reports fuel/battery as a 0.0-1.0 fraction; null for
-        # non-electric vehicles, so preserve None rather than coercing to 0.
-        "battery_level": round(fuel_fraction * 100) if fuel_fraction is not None else None,
-        # GBFS 2.3 has no per-vehicle timestamp; feed-level last_updated applies to all.
+        "battery_level": battery_level,
+        # GBFS 2.2 has no per-vehicle timestamp in this feed; feed-level
+        # last_updated applies to all records in the same poll cycle.
         "reported_at": reported_at,
     }
 
@@ -208,9 +257,10 @@ def run_ingest_cycle() -> None:
             error_message = "empty feed"
             return
 
-        records = [normalize_bike(bike, reported_at) for bike in bikes]
+        type_ranges = fetch_vehicle_type_ranges()
+        records = [normalize_bike(bike, reported_at, type_ranges) for bike in bikes]
         vehicles_fetched = len(records)
-        logger.info("Fetched %d vehicles from Bay Wheels", vehicles_fetched)
+        logger.info("Fetched %d vehicles from Lime", vehicles_fetched)
 
         redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
         redis_success = write_to_redis(redis_client, records)
