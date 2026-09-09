@@ -1,4 +1,4 @@
-# gbfs-fleet-telemetry
+# GBFS Fleet Telemetry
 
 Telemetry pipeline for a bike/scooter fleet, built on Lime's public GBFS feed for San Francisco. Uses live vehicle data as a stand-in for a real edge hardware fleet: ingestion, storage, pipeline observability, and Grafana dashboards, all running locally in Docker.
 
