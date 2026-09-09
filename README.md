@@ -18,12 +18,12 @@ What's not built is listed at the bottom.
 ## Dashboards
 
 ### Fleet Status
-![Fleet Status dashboard](./docs/screenshots/fleet-status-dashboard.png)
+![Fleet Status dashboard](./docs/screenshots/fleet_status.png)
 
 Availability gauge, battery distribution, and a list of vehicles that get disabled most often. Battery level is tracked separately from the disabled flag on purpose. A vehicle can hit 0% charge without ever being marked disabled by Lime's system, and I wanted a panel that would catch that.
 
 ### Pipeline Health
-![Pipeline Health dashboard](./docs/screenshots/pipeline-health-dashboard.png)
+![Pipeline Health dashboard](./docs/screenshots/pipeline_health.png)
 
 Built around the four golden signals: freshness, errors, latency, traffic. This one watches the pipeline itself, not the fleet.
 
