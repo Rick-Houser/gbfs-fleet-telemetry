@@ -39,13 +39,13 @@ flowchart TD
 
     subgraph Integration["Integration"]
         B -->|cache current state| C[(Redis)]
-        B -->|append + upsert| F[(PostgreSQL)]
-        B -->|log run health| I[(ingest_run_log)]
+        B -->|persist vehicle data| F[(PostgreSQL)]
+        B -->|log run health| F
     end
 
     subgraph Visualization["Visualization"]
         F -->|fleet status| J[Grafana: Fleet Status]
-        I -->|pipeline health| K[Grafana: Pipeline Health]
+        F -->|pipeline health| K[Grafana: Pipeline Health]
     end
 ```
 
